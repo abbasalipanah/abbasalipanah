@@ -1,0 +1,701 @@
+import json
+import requests
+import pandas as pd
+import time
+import io
+from datetime import datetime, timedelta
+from urllib.parse import urlparse, parse_qs
+from googleapiclient.discovery import build
+from google.oauth2.service_account import Credentials
+from ipywidgets import DatePicker, Button
+from IPython.display import display
+from googleapiclient.http import MediaIoBaseDownload
+from google.oauth2 import service_account
+from googleapiclient.errors import HttpError
+
+##############################
+# Configuration and Constants
+##############################
+
+ARS_FOLDER_ID = "1YPi-e-60YYGPa5A7wIN4JhXRlp0JPlA1"  # ARS main folder
+CLIENT_FOLDER_NAME = "Ela Hotels"
+CLIENT_NAME = "Ela Excellence Resort Belek"
+
+# Meta Ads Config
+META_ACCOUNTS = [
+    {"name": "Ela Excellence Resort", "id": "act_173043833329201"},
+    {"name": "Ela Excellence Resort (2)", "id": "act_3761991474028551"}
+]
+META_ACCESS_TOKEN = "EAAQHEQHp6jABO6m4cqKnSyztrSldgTcwxI7zJZBtfYd6nReMTaO4nyFXltYDkP5YCEtrDN7GIS10hRY7CURZBdprNWQIc1HzZARRkkZBNQB8zYLC4x54XsiCNZA7hZC7K2mECkF7BQD0ytN9WOvpWJJu4K1lw7beZBt6IBNw62Fs9nEf2vNOvj9jVPgimZCB5hqZClp3IQdhaEcq9TwS1WmyWgCCtgMlfpKZC47DViNfCk2FEDvAvLWQETVbkVxzOGz5IZD"
+
+# Yandex Direct Config
+YANDEX_CLIENT_LOGIN = "elaresorthotel"
+YANDEX_ACCESS_TOKEN = "y0_AgAAAABUzWDjAAzOfwAAAAEZgtLVAAC0zGEqhZlDiosBqTHLSkGMqxz45g"
+YANDEX_HEADERS = {
+    "Authorization": f"Bearer {YANDEX_ACCESS_TOKEN}",
+    "Accept-Language": "en",
+    "Content-Type": "application/json",
+    "Client-Login": YANDEX_CLIENT_LOGIN
+}
+REPORTS_URL = "https://api.direct.yandex.com/json/v5/reports"
+
+# GA4 Config
+GA4_PROPERTY_ID = "331618583"
+GA4_SERVICE_ACCOUNT_FILE = "/content/drive/MyDrive/API/G - Drive /first-dex-ela-38458f3be967.json"
+
+# DV360 Config
+DV360_SERVICE_ACCOUNT_FILE = "/content/drive/MyDrive/API/DV360/DV360-first-dex-ela-59b48212cd42.json"
+# If you have a DV360 Query ID via DBM API, set it here, otherwise use lineItems logic
+DV360_QUERY_ID = None  
+
+# CM360 Config
+CM360_SERVICE_ACCOUNT_FILE = "/content/drive/MyDrive/API/Campaign Manager 360/campaign-manager-first-dex-ela-5082d1d00701.json"
+CM360_SCOPES = [
+    'https://www.googleapis.com/auth/dfatrafficking',
+    'https://www.googleapis.com/auth/dfareporting'
+]
+CM360_ADVERTISER_ID = "11562326"  # Adjust as needed
+
+HEADERS_DICT = {
+    "Meta": [
+        "Date", "Campaign name", "Country", "Campaign objective", "Impressions",
+        "Link clicks", "Cost", "Reach", "Post engagements",
+        "Kampanya", "Bölge", "Kampanya Amacı", "Kampanya Türü", "Ülke"
+    ],
+    "Yandex": [
+        "Tarih", "Kampanya Adı", "Ülke", "Gösterim",
+        "Tıklama", "Harcanan Bütçe", "Bölge", "Kampanya", "Kampanya Amacı"
+    ],
+    "Google Analytics 4": [
+        "First user source / medium", "User campaign name", "Country", "Sessions",
+        "Average session duration", "Purchases", "Revenue", "Key event count for WhatsApp",
+        "Key event count for tel_click", "Views per session", "Kampanya", "Bölge",
+        "Kampanya Amacı", "Kampanya Türü", "Ülke", "Average session duration (T)"
+    ],
+    "DV 360": [
+        "Date", "Impressions", "Link clicks", "Cost", "Reach",
+        "Post engagements", "Kampanya", "Bölge",
+        "Kampanya Amacı", "Kampanya Türü", "Ülke"
+    ],
+    "Campaign Manager 360": [
+        "Date", "Impressions", "Link clicks", "Cost", "Reach",
+        "Post engagements", "Kampanya", "Bölge",
+        "Kampanya Amacı", "Kampanya Türü", "Ülke"
+    ],
+    "Microsoft Ads": [
+        "Campaign", "Impressions", "Clicks", "Cost", "Country",
+        "Kampanya", "Bölge", "Kampanya Amacı", "Kampanya Türü", "Ülke"
+    ],
+    "VK": [
+        "Campaign", "Impressions", "Clicks", "Cost", "Country",
+        "Kampanya", "Bölge", "Kampanya Amacı", "Kampanya Türü", "Ülke"
+    ]
+}
+
+MAIN_CREDENTIALS = Credentials.from_service_account_file(GA4_SERVICE_ACCOUNT_FILE, scopes=['https://www.googleapis.com/auth/drive','https://www.googleapis.com/auth/spreadsheets'])
+drive_service = build('drive', 'v3', credentials=MAIN_CREDENTIALS)
+sheets_service = build('sheets', 'v4', credentials=MAIN_CREDENTIALS)
+
+
+#####################
+# Helper Functions
+#####################
+
+def get_or_create_client_folder(parent_folder_id, client_folder_name):
+    query = f"'{parent_folder_id}' in parents and name='{client_folder_name}' and mimeType='application/vnd.google-apps.folder'"
+    response = drive_service.files().list(q=query, spaces='drive', fields='files(id,name)').execute()
+    files = response.get('files', [])
+    if files:
+        return files[0]['id']
+    else:
+        folder_metadata = {
+            'name': client_folder_name,
+            'mimeType': 'application/vnd.google-apps.folder',
+            'parents': [parent_folder_id]
+        }
+        folder = drive_service.files().create(body=folder_metadata, fields='id').execute()
+        print(f"Created folder for client: {client_folder_name}")
+        return folder.get('id')
+
+CLIENT_FOLDER_ID = get_or_create_client_folder(ARS_FOLDER_ID, CLIENT_FOLDER_NAME)
+
+def create_or_get_monthly_sheet(client_name, date_str):
+    # date_str format: YYYY-MM-DD
+    year = date_str.split("-")[0]
+    month_index = int(date_str.split("-")[1]) - 1
+    turkish_months = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran",
+                      "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"]
+    turkish_month = turkish_months[month_index]
+    file_name = f"{client_name} {turkish_month} {year}"
+
+    query = f"'{CLIENT_FOLDER_ID}' in parents and name='{file_name}' and mimeType='application/vnd.google-apps.spreadsheet'"
+    existing_files = drive_service.files().list(q=query, spaces='drive', fields='files(id, name)').execute()
+    files = existing_files.get('files', [])
+    if files:
+        sheet_id = files[0]['id']
+        newly_created = False
+    else:
+        sheet_metadata = {
+            'name': file_name,
+            'mimeType': 'application/vnd.google-apps.spreadsheet',
+            'parents': [CLIENT_FOLDER_ID],
+        }
+        sheet = drive_service.files().create(body=sheet_metadata, fields='id').execute()
+        sheet_id = sheet.get('id')
+        newly_created = True
+
+        requests_body = []
+        for platform_name, headers in HEADERS_DICT.items():
+            requests_body.append({"addSheet": {"properties": {"title": platform_name}}})
+
+        sheets_service.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"requests": requests_body}
+        ).execute()
+
+        for platform_name, headers in HEADERS_DICT.items():
+            sheets_service.spreadsheets().values().update(
+                spreadsheetId=sheet_id,
+                range=f"{platform_name}!A1",
+                valueInputOption="RAW",
+                body={'values': [headers]}
+            ).execute()
+
+        # Default "Sheet1" removal if exists
+        sheet_info = sheets_service.spreadsheets().get(spreadsheetId=sheet_id).execute()
+        for s in sheet_info.get('sheets', []):
+            if s['properties']['title'].lower() == "sheet1":
+                sid = s['properties']['sheetId']
+                sheets_service.spreadsheets().batchUpdate(
+                    spreadsheetId=sheet_id,
+                    body={"requests": [{"deleteSheet": {"sheetId": sid}}]}
+                ).execute()
+                print("Deleted sheet: Sheet1")
+
+    return sheet_id, newly_created
+
+def append_new_data(sheet_id, sheet_name, new_data):
+    if not new_data:
+        print(f"No new data to append for {sheet_name}.")
+        return
+    sheets_service.spreadsheets().values().append(
+        spreadsheetId=sheet_id,
+        range=f"{sheet_name}!A1",
+        valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
+        body={'values': new_data}
+    ).execute()
+    print(f"Appended {len(new_data)} rows to {sheet_name}.")
+
+def split_date_range_by_months(start_date_str, end_date_str):
+    start = datetime.strptime(start_date_str, "%Y-%m-%d")
+    end = datetime.strptime(end_date_str, "%Y-%m-%d")
+
+    segments = []
+    current_start = start
+
+    while current_start <= end:
+        month_end = (current_start.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+        segment_end = min(month_end, end)
+        segments.append((current_start.strftime("%Y-%m-%d"), segment_end.strftime("%Y-%m-%d")))
+        current_start = segment_end + timedelta(days=1)
+
+    return segments
+
+#############################
+# Meta Fetch
+#############################
+
+def get_meta_data(account_id, start_date, end_date):
+    date_range = pd.date_range(start=start_date, end=end_date)
+    all_data = []
+
+    for single_date in date_range:
+        date_str = single_date.strftime("%Y-%m-%d")
+        params = {
+            "access_token": META_ACCESS_TOKEN,
+            "fields": "campaign_name,impressions,clicks,spend,cpc,cpm,ctr",
+            "time_range": json.dumps({"since": date_str, "until": date_str}),
+            "level": "campaign",
+            "breakdowns": "country",
+        }
+        try:
+            while True:
+                response = requests.get(
+                    f"https://graph.facebook.com/v16.0/{account_id}/insights",
+                    params=params
+                )
+                response.raise_for_status()
+                response_data = response.json()
+
+                data = response_data.get("data", [])
+                for entry in data:
+                    entry["Date"] = date_str
+                    entry["cost"] = entry.get("spend", 0)
+                    all_data.append(entry)
+
+                paging = response_data.get("paging", {})
+                next_page = paging.get("next")
+                if not next_page:
+                    break
+
+                # Handle pagination
+                next_page_params = parse_qs(urlparse(next_page).query)
+                params = {"access_token": META_ACCESS_TOKEN}
+                for key, value in next_page_params.items():
+                    params[key] = value[0] if value else None
+
+        except requests.RequestException as e:
+            print(f"Error fetching Meta data for {date_str}: {e}")
+
+    if all_data:
+        meta_df = pd.DataFrame(all_data).rename(columns={
+            "Date": "Date",
+            "campaign_name": "Campaign name",
+            "country": "Country",
+            "impressions": "Impressions",
+            "clicks": "Link clicks",
+            "spend": "Cost",
+            "cpc": "CPC",
+            "cpm": "CPM",
+            "ctr": "CTR"
+        }).fillna(0)
+        for col in HEADERS_DICT["Meta"]:
+            if col not in meta_df.columns:
+                meta_df[col] = ""
+        meta_df = meta_df[HEADERS_DICT["Meta"]]
+        return meta_df
+    else:
+        return pd.DataFrame(columns=HEADERS_DICT["Meta"])
+
+def fetch_meta_data(start_date, end_date):
+    all_frames = []
+    for account in META_ACCOUNTS:
+        df = get_meta_data(account["id"], start_date, end_date)
+        if not df.empty:
+            all_frames.append(df)
+    if all_frames:
+        return pd.concat(all_frames, ignore_index=True)
+    else:
+        return pd.DataFrame(columns=HEADERS_DICT["Meta"])
+
+#############################
+# Yandex Fetch
+#############################
+
+def generate_yandex_report(client_login, start_date, end_date):
+    headers = YANDEX_HEADERS.copy()
+    headers["Client-Login"] = client_login
+    unique_report_name = f"All_Campaigns_Report_{int(datetime.now().timestamp())}"
+    body = {
+        "params": {
+            "SelectionCriteria": {
+                "DateFrom": start_date,
+                "DateTo": end_date
+            },
+            "FieldNames": [
+                "Date",
+                "CampaignName",
+                "Impressions",
+                "Clicks",
+                "Cost",
+                "LocationOfPresenceName"
+            ],
+            "ReportName": unique_report_name,
+            "ReportType": "CUSTOM_REPORT",
+            "DateRangeType": "CUSTOM_DATE",
+            "Format": "TSV",
+            "IncludeVAT": "NO",
+            "IncludeDiscount": "NO",
+        },
+    }
+
+    retry_count = 0
+    max_retries = 10
+    while retry_count < max_retries:
+        response = requests.post(REPORTS_URL, json=body, headers=headers)
+        if response.status_code == 200:
+            return response.text
+        elif response.status_code in [201, 202]:
+            retry_in = int(response.headers.get("retryIn", 5))
+            print(f"Yandex report being prepared. Retrying in {retry_in} seconds...")
+            time.sleep(retry_in)
+            retry_count += 1
+        else:
+            print(f"Error generating Yandex report: {response.status_code} - {response.text}")
+            return None
+    print("Failed to generate Yandex report after maximum retries.")
+    return None
+
+def parse_yandex_report(report_text):
+    if not report_text:
+        return pd.DataFrame(columns=HEADERS_DICT["Yandex"])
+    lines = report_text.strip().split("\n")
+
+    header_line = 0
+    for i, line in enumerate(lines):
+        if line.startswith("Date\t"):
+            header_line = i
+            break
+
+    data_lines = lines[header_line+1:]
+    new_data = []
+    for row in data_lines:
+        if not row.strip():
+            continue
+        cols = row.split("\t")
+        if len(cols) < 6:
+            continue
+        date_val, camp_name, impressions, clicks, cost, location = cols
+        new_data.append([
+            date_val,
+            camp_name,
+            "",           # Ülke
+            impressions,
+            clicks,
+            cost,
+            location,
+            "",           # Kampanya
+            ""            # Kampanya Amacı
+        ])
+    return pd.DataFrame(new_data, columns=HEADERS_DICT["Yandex"]) if new_data else pd.DataFrame(columns=HEADERS_DICT["Yandex"])
+
+def fetch_yandex_data(start_date, end_date):
+    report_text = generate_yandex_report(YANDEX_CLIENT_LOGIN, start_date, end_date)
+    if report_text:
+        return parse_yandex_report(report_text)
+    else:
+        return pd.DataFrame(columns=HEADERS_DICT["Yandex"])
+
+#############################
+# GA4 Fetch
+#############################
+
+def fetch_ga4_data(property_id, start_date, end_date):
+    print("Fetching GA4 data...")
+    ga4_creds = Credentials.from_service_account_file(GA4_SERVICE_ACCOUNT_FILE)
+    analytics_data = build('analyticsdata', 'v1beta', credentials=ga4_creds)
+
+    request_body = {
+        "dateRanges": [{"startDate": start_date, "endDate": end_date}],
+        "dimensions": [{"name": "country"}, {"name": "sessionDefaultChannelGrouping"}],
+        "metrics": [{"name": "sessions"}, {"name": "averageSessionDuration"}, {"name": "purchaseRevenue"}],
+        "limit": 1000
+    }
+    response = analytics_data.properties().runReport(
+        property=f"properties/{property_id}",
+        body=request_body
+    ).execute()
+
+    rows = response.get("rows", [])
+    new_data = []
+    for row in rows:
+        dims = row.get("dimensionValues", [])
+        mets = row.get("metricValues", [])
+        country_val = dims[0].get("value", "")
+        channel_val = dims[1].get("value", "")
+        sessions_val = mets[0].get("value", "")
+        avg_dur_val = mets[1].get("value", "")
+        revenue_val = mets[2].get("value", "")
+
+        new_data.append([
+            channel_val, "", country_val, sessions_val,
+            avg_dur_val, "", revenue_val, "", "",
+            "", "", "", "", "", "", ""
+        ])
+    return pd.DataFrame(new_data, columns=HEADERS_DICT["Google Analytics 4"]) if new_data else pd.DataFrame(columns=HEADERS_DICT["Google Analytics 4"])
+
+#############################
+# DV360 Fetch
+#############################
+
+def fetch_dv360_data(start_date, end_date):
+    if DV360_QUERY_ID:
+        # If you have a saved DV360 Query via DBM API, implement retrieval here.
+        print("DV360 Query-based retrieval not implemented yet.")
+        return pd.DataFrame(columns=HEADERS_DICT["DV 360"])
+
+    print("Fetching DV360 data via lineItems...")
+    dv360_creds = Credentials.from_service_account_file(DV360_SERVICE_ACCOUNT_FILE)
+    dv360_service = build('displayvideo', 'v3', credentials=dv360_creds)
+
+    advertiser_id = '843330213'  # Replace with your DV360 advertiser ID
+    data = []
+    page_token = None
+
+    try:
+        while True:
+            request = dv360_service.advertisers().lineItems().list(
+                advertiserId=advertiser_id,
+                pageToken=page_token
+            )
+            response = request.execute()
+
+            if 'lineItems' in response:
+                for item in response['lineItems']:
+                    flight_dates = item.get('flight', {}).get('dateRange', {})
+                    sd = flight_dates.get('startDate', {})
+                    ed = flight_dates.get('endDate', {})
+
+                    if sd and ed:
+                        start_item = datetime(sd['year'], sd['month'], sd['day'])
+                        end_item = datetime(ed['year'], ed['month'], ed['day'])
+
+                        # Check overlap with requested range
+                        req_start = datetime.strptime(start_date, '%Y-%m-%d')
+                        req_end = datetime.strptime(end_date, '%Y-%m-%d')
+                        if (start_item <= req_end) and (end_item >= req_start):
+                            # Iterate over overlapping days
+                            current_date = max(start_item, req_start)
+                            last_date = min(end_item, req_end)
+                            while current_date <= last_date:
+                                # If line items do not have delivered metrics in the API directly,
+                                # consider that cost/clicks/impressions might be from a different endpoint
+                                # or not available yet.
+
+                                impressions = int(item.get('impressionsDelivered', 0))
+                                clicks = int(item.get('clicksDelivered', 0))
+                                cost = float(item.get('pacing', {}).get('dailyMaxMicros', '0')) / 1e6
+                                reach = int(item.get('reachDelivered', 0))
+                                post_engagements = int(item.get('postEngagementsDelivered', 0))
+
+                                data.append([
+                                    current_date.strftime('%Y-%m-%d'),
+                                    impressions, clicks, cost, reach, post_engagements,
+                                    item.get('displayName', 'N/A'),
+                                    ', '.join(item.get('geoTargeting', {}).get('regions', ['N/A'])),
+                                    item.get('campaignGoal', {}).get('goalType', 'N/A'),
+                                    item.get('lineItemType', 'N/A'),
+                                    ', '.join(item.get('geoTargeting', {}).get('countries', ['N/A']))
+                                ])
+                                current_date += timedelta(days=1)
+
+            page_token = response.get('nextPageToken')
+            if not page_token:
+                break
+    except HttpError as e:
+        print("HTTP Error fetching DV360 data:", e)
+
+    df = pd.DataFrame(data, columns=HEADERS_DICT["DV 360"]) if data else pd.DataFrame(columns=HEADERS_DICT["DV 360"])
+    if df.empty:
+        print("No DV360 data found for this period.")
+    return df
+
+#############################
+# CM360 Fetch
+#############################
+
+def fetch_user_profiles_cm360(service):
+    profiles = service.userProfiles().list().execute().get('items', [])
+    return profiles[0]['profileId'] if profiles else None
+
+def fetch_all_campaigns_cm360(service, profile_id, advertiser_id):
+    campaigns = []
+    next_page_token = None
+    while True:
+        request = service.campaigns().list(profileId=profile_id, advertiserIds=[advertiser_id], pageToken=next_page_token)
+        response = request.execute()
+        c = response.get('campaigns', [])
+        if c:
+            campaigns.extend(c)
+        next_page_token = response.get('nextPageToken')
+        if not next_page_token:
+            break
+    return campaigns
+
+def create_cm360_report(service, profile_id, advertiser_id, start_date, end_date, campaign_id):
+    # Add date dimension to ensure date column
+    report_body = {
+        "kind": "dfareporting#report",
+        "name": "Custom Performance Report",
+        "type": "STANDARD",
+        "criteria": {
+            "dateRange": {
+                "startDate": start_date,
+                "endDate": end_date
+            },
+            "dimensions": [
+                {"name": "date"},
+                {"name": "campaign"}
+            ],
+            "metricNames": [
+                "impressions",
+                "clicks"
+            ],
+            "dimensionFilters": [
+                {
+                    "dimensionName": "campaignId",
+                    "value": campaign_id
+                }
+            ]
+        },
+        "ownerProfileId": profile_id
+    }
+
+    response = service.reports().insert(profileId=profile_id, body=report_body).execute()
+    return response['id']
+
+def run_and_download_cm360_report(service, profile_id, report_id):
+    run_response = service.reports().run(profileId=profile_id, reportId=report_id).execute()
+    file_id = run_response['id']
+
+    while True:
+        file_status = service.reports().files().get(profileId=profile_id, reportId=report_id, fileId=file_id).execute()
+        status = file_status['status']
+        if status == 'REPORT_AVAILABLE':
+            break
+        elif status in ['PROCESSING', 'QUEUED']:
+            time.sleep(10)
+        else:
+            print(f"CM360 report failed with status: {status}")
+            return None
+
+    request = service.reports().files().get_media(profileId=profile_id, reportId=report_id, fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        status, done = downloader.next_chunk()
+    fh.seek(0)
+    return fh
+
+def parse_cm360_csv(fh):
+    raw_data = fh.read().decode('utf-8')
+    print("Raw CM360 CSV Data:\n", raw_data)  # Debug: print raw CSV
+    lines = raw_data.strip().split("\n")
+    if len(lines) <= 1:
+        print("No data in CM360 report.")
+        return pd.DataFrame(columns=HEADERS_DICT["Campaign Manager 360"])
+
+    headers = lines[0].split(",")
+    data_rows = [l.split(",") for l in lines[1:]]
+
+    print("CM360 Headers found:", headers)  # Debug
+
+    # Attempt to locate required columns
+    # We requested "date", "campaign", "impressions", "clicks"
+    # The CSV might name "date" dimension differently. Let's find columns by name.
+    impressions_idx = None
+    clicks_idx = None
+    date_idx = None
+
+    for i, h in enumerate(headers):
+        hl = h.lower()
+        if "date" in hl:
+            date_idx = i
+        if "impression" in hl and "viewable" not in hl and "measurable" not in hl:
+            impressions_idx = i
+        if "click" in hl:
+            clicks_idx = i
+
+    if date_idx is None or impressions_idx is None or clicks_idx is None:
+        print("Could not find required columns in CM360 report. Headers:", headers)
+        return pd.DataFrame(columns=HEADERS_DICT["Campaign Manager 360"])
+
+    new_data = []
+    for row in data_rows:
+        date_val = row[date_idx] if date_idx < len(row) else ""
+        impressions = row[impressions_idx] if impressions_idx < len(row) else ""
+        clicks = row[clicks_idx] if clicks_idx < len(row) else ""
+        # Fill empty columns for CM360 since we don't have cost/reach/post engagements from the standard report
+        new_data.append([
+            date_val, impressions, clicks, "", "", "", "", "", "", "", ""
+        ])
+    return pd.DataFrame(new_data, columns=HEADERS_DICT["Campaign Manager 360"])
+
+def fetch_cm360_data(start_date, end_date):
+    print("Fetching Campaign Manager 360 data...")
+    cm360_creds = service_account.Credentials.from_service_account_file(CM360_SERVICE_ACCOUNT_FILE, scopes=CM360_SCOPES)
+    service = build('dfareporting', 'v4', credentials=cm360_creds)
+
+    profile_id = fetch_user_profiles_cm360(service)
+    if not profile_id:
+        print("No CM360 profiles found.")
+        return pd.DataFrame(columns=HEADERS_DICT["Campaign Manager 360"])
+
+    campaigns = fetch_all_campaigns_cm360(service, profile_id, CM360_ADVERTISER_ID)
+    if not campaigns:
+        print("No CM360 campaigns found for the given advertiser.")
+        return pd.DataFrame(columns=HEADERS_DICT["Campaign Manager 360"])
+
+    # Just pick the first campaign for demonstration
+    campaign_id = campaigns[0]['id']
+    report_id = create_cm360_report(service, profile_id, CM360_ADVERTISER_ID, start_date, end_date, campaign_id)
+    fh = run_and_download_cm360_report(service, profile_id, report_id)
+    if fh is None:
+        return pd.DataFrame(columns=HEADERS_DICT["Campaign Manager 360"])
+
+    df = parse_cm360_csv(fh)
+    return df
+
+#############################
+# Microsoft Ads & VK (Placeholders)
+#############################
+
+def fetch_microsoft_ads_data(start_date, end_date):
+    print("Fetching Microsoft Ads data (placeholder)...")
+    return pd.DataFrame(columns=HEADERS_DICT["Microsoft Ads"])
+
+def fetch_vk_data(start_date, end_date):
+    print("Fetching VK data (placeholder)...")
+    return pd.DataFrame(columns=HEADERS_DICT["VK"])
+
+###########################
+# Main Script
+###########################
+
+def main():
+    print("Please enter the date range for fetching data.")
+    start_date = input("Enter the start date (YYYY-MM-DD): ").strip()
+    end_date = input("Enter the end date (YYYY-MM-DD): ").strip()
+
+    try:
+        # Validate the date formats
+        datetime.strptime(start_date, '%Y-%m-%d')
+        datetime.strptime(end_date, '%Y-%m-%d')
+    except ValueError as e:
+        print(f"Invalid date format: {e}")
+        return
+
+    if start_date >= end_date:
+        print("Start date must be earlier than end date.")
+        return
+
+    print(f"Fetching data for {CLIENT_NAME} from {start_date} to {end_date}...")
+
+    # Split into monthly segments
+    month_segments = split_date_range_by_months(start_date, end_date)
+    for seg_start, seg_end in month_segments:
+        print(f"Processing monthly segment: {seg_start} to {seg_end}")
+        sheet_id, newly_created = create_or_get_monthly_sheet(CLIENT_NAME, seg_start)
+
+        meta_data = fetch_meta_data(seg_start, seg_end)
+        yandex_data = fetch_yandex_data(seg_start, seg_end)
+        ga4_data = fetch_ga4_data(GA4_PROPERTY_ID, seg_start, seg_end)
+        dv360_data = fetch_dv360_data(seg_start, seg_end)
+        cm360_data = fetch_cm360_data(seg_start, seg_end)
+        microsoft_ads_data = fetch_microsoft_ads_data(seg_start, seg_end)
+        vk_data = fetch_vk_data(seg_start, seg_end)
+
+        platform_data = [
+            ("Meta", meta_data),
+            ("Yandex", yandex_data),
+            ("Google Analytics 4", ga4_data),
+            ("DV 360", dv360_data),
+            ("Campaign Manager 360", cm360_data),
+            ("Microsoft Ads", microsoft_ads_data),
+            ("VK", vk_data)
+        ]
+
+        for platform_name, df in platform_data:
+            if not df.empty:
+                append_new_data(sheet_id, platform_name, df.values.tolist())
+                print(f"Data from {platform_name} successfully appended.")
+            else:
+                print(f"No data found for {platform_name}.")
+
+    print("Data fetching and appending process completed successfully.")
+
+
+if __name__ == "__main__":
+    main()
